@@ -191,7 +191,7 @@ USART1 使用单字节接收中断写入 63 字节环形缓冲，供主循环解
 
 ## 构建、重生成与备份
 
-2026-11-01 的定时开环测试版全量 Keil 构建为 **0 错误、0 警告**；Code=23944、RO=1612、RW=116、ZI=2444 字节。默认模式独立 ARM 仿真 **18/18** 通过，另以 `MOTOR_OPEN_LOOP_TEST=0` 重跑原霍尔回归 **25/25** 通过。有刷 **5/5**、CAN **507 条断言**、编码器 **41 条断言**也通过。测试方法和硬件边界见 `verification/open_loop_test/README.md`，未烧录或实测电机。
+2026-11-01 的定时开环测试版全量 Keil 构建为 **0 错误、0 警告**；Code=23796、RO=1440、RW=120、ZI=2440 字节。默认模式独立 ARM 仿真 **15/15** 通过，另以 `MOTOR_OPEN_LOOP_TEST=0` 重跑原霍尔回归 **25/25** 通过。有刷 **5/5**、CAN **507 条断言**、编码器 **41 条断言**也通过。测试方法和硬件边界见 `verification/open_loop_test/README.md`，未烧录或实测电机。
 
 当前烧录文件为 `MDK-ARM/stm32motor/stm32motor.hex`，另保存同内容的明确命名副本 `stm32motor_open_loop_test.hex`。正常霍尔版源码与 HEX 已在 `backup/pre_open_loop_test_20261101_145358` 保存；恢复时也可将模式宏改为 0 后重新编译。备份与 HEX 都不纳入 Git 源码。
 
@@ -201,7 +201,7 @@ USART1 使用单字节接收中断写入 63 字节环形缓冲，供主循环解
 powershell -ExecutionPolicy Bypass -File .\usar\verification\rebuild.ps1
 ```
 
-UART 句柄路由为 USART3 控制台 PB10/PB11、USART1 RS485 PB6/PB7、PB5 控制并联的 DE 和 /RE。霍尔逻辑码和 `hall_raw` 按 PB0:PA7:PA6 位序，仿真同步注入对应物理引脚。模式 0 的 **25/25** 霍尔回归保留低有效保护、首次故障快照、MOE 等待期间短 Break 及人工同步读对照；该对照不是周期精确模型，也不证明实板故障根因。默认模式 1 的 **18/18** 开环回归独立验证双向六步、时间边界、占空上限、累计预算和保护。当前测试目标仍启用正常 BKIN 保护，RS485 尚未实板验证。复跑步骤见各 `verification/*_test/README.md`，源码与固件哈希、构建摘要见 `verification/port_validation.json`。模拟测试不代替实板验证。
+UART 句柄路由为 USART3 控制台 PB10/PB11、USART1 RS485 PB6/PB7、PB5 控制并联的 DE 和 /RE。霍尔逻辑码和 `hall_raw` 按 PB0:PA7:PA6 位序，仿真同步注入对应物理引脚。模式 0 的 **25/25** 霍尔回归保留低有效保护、首次故障快照、MOE 等待期间短 Break 及人工同步读对照；该对照不是周期精确模型，也不证明实板故障根因。默认模式 1 的 **15/15** 开环回归独立验证双向六步、100 ms 换相周期、占空上限和保护。当前测试目标仍启用正常 BKIN 保护，RS485 尚未实板验证。复跑步骤见各 `verification/*_test/README.md`，源码与固件哈希、构建摘要见 `verification/port_validation.json`。模拟测试不代替实板验证。
 
 主程序集成与 fatal 停机调用均位于 CubeMX USER CODE 区域。USART1 的 38400 波特率和 NVIC 优先级 6 已写入 `stm32motor.ioc`。重新生成后核对 Keil 仍包含 `../usar` 头文件路径及 `Application/User/usar` 组的六个 `.c` 文件。测试用的 mock/HAL 文件位于 `verification`，不加入固件构建。
 
