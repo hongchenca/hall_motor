@@ -1,0 +1,42 @@
+# Historical local backups are not part of the current source tree.
+**/usar/backup/
+*.bak
+
+# Keil build output and machine-local IDE/debugger settings.
+**/MDK-ARM/stm32motor/
+**/MDK-ARM/DebugConfig/
+*.uvguix.*
+*.uvoptx
+*.o
+*.obj
+*.axf
+*.elf
+*.hex
+*.bin
+*.crf
+*.d
+*.dep
+*.map
+*.lst
+*.lnp
+*.log
+
+# Generated test reports contain local paths and can be regenerated.
+**/verification/*/results.json
+**/verification/*/build_log.json
+**/verification/port_validation.json
+
+# Downloaded reference manuals and local download metadata.
+**/verification/references/*.pdf
+**/verification/references/*.source.json
+
+# Python/editor caches and local environment files.
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
