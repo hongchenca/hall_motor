@@ -45,8 +45,9 @@ PHASES = {
 
 
 def build():
-    # Compile the normal production configuration, with no test feature overrides.
-    common = [str(ARM_BIN / "armcc.exe"), "--cpu", "Cortex-M3", "--thumb", "--c99", "-O1", "-g", "-I", str(HERE / "mock"), "-I", str(PROJECT / "usar")]
+    # Select the retained Hall firmware even when the board build selects the
+    # separate open-loop test mode. No protection feature is overridden.
+    common = [str(ARM_BIN / "armcc.exe"), "--cpu", "Cortex-M3", "--thumb", "--c99", "-O1", "-g", "-DMOTOR_OPEN_LOOP_TEST=0", "-I", str(HERE / "mock"), "-I", str(PROJECT / "usar")]
     module_object = HERE / "bldc_motor.o"
     harness_object = HERE / "harness.o"
     commands = [
@@ -735,6 +736,7 @@ def main():
         "module": str(MODULE),
         "module_sha256": hashlib.sha256(MODULE.read_bytes()).hexdigest(),
         "config_sha256": hashlib.sha256(CONFIG.read_bytes()).hexdigest(),
+        "mode": "Hall commutation (MOTOR_OPEN_LOOP_TEST=0)",
         "synthetic_comparison_baseline_module": str(BASELINE_MODULE),
         "synthetic_comparison_baseline_sha256": hashlib.sha256(BASELINE_MODULE.read_bytes()).hexdigest(),
         "method": "ARMCC compiles actual bldc_motor.c; Unicorn executes Thumb; HAL and register storage mocked; TIM2 CNT increments per read",

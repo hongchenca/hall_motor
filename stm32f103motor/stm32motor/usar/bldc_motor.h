@@ -30,6 +30,9 @@ typedef struct {
     uint8_t hall;
     uint8_t voltage_ready;
     uint8_t command_timed_out;
+    uint8_t open_loop_test;
+    uint8_t commutation_step; /* 1..6 in the forward physical phase list; 0 off. */
+    uint16_t commutation_interval_ticks; /* Current full step interval, 50 us. */
 } BldcStatus;
 
 typedef enum {
@@ -61,7 +64,8 @@ void Bldc_BreakIrq(void);
 void Bldc_CaptureBreakIrq(void);
 void Bldc_GetBreakDiagnostic(BldcBreakDiagnostic *diagnostic);
 void Bldc_GetStatus(BldcStatus *status);
-/* No automatic fault recovery. Requires zero command, healthy supply/Hall/BKIN. */
+/* No automatic recovery. Requires zero command and healthy supply/BKIN.
+ * Hall validity is required only when the normal Hall controller is built. */
 HAL_StatusTypeDef Bldc_ClearFault(void);
 void Bldc_EmergencyStop(void);
 

@@ -13,6 +13,12 @@
 #define CONSOLE_BAUD_RATE 115200U
 #define CONSOLE_BITS_PER_BYTE 10U
 #define CONSOLE_TX_MARGIN_MS 10U
+#if MOTOR_OPEN_LOOP_TEST
+#define UART_MOTOR_MAX_PERCENT MOTOR_OPEN_LOOP_MAX_DUTY_PERCENT
+#else
+#define UART_MOTOR_MAX_PERCENT 100U
+#endif
+#define UART_MOTOR_DEFAULT_PERCENT 10U
 
 static uint8_t app_ready;
 static uint32_t led_changed_ms;
@@ -28,6 +34,8 @@ static int8_t uart_motor_direction;
 static uint8_t brushed_motor_running;
 static uint8_t brushed_motor_speed_percent;
 static int8_t brushed_motor_direction;
+static uint32_t last_hall_print_ms;
+static uint8_t hall_print_active;
 
 static HAL_StatusTypeDef console_transmit(const uint8_t *data, uint16_t length)
 {
@@ -143,7 +151,6 @@ static void select_uart_control(void)
     if (uart_control_active == 0U) {
         Bldc_EmergencyStop();
         uart_motor_running = 0U;
-        uart_motor_speed_percent = 0U;
         uart_control_active = 1U;
     }
 }
@@ -240,16 +247,38 @@ static void debug_status(void)
     if (length > 0 && length < (int)sizeof(text)) {
         (void)console_transmit((const uint8_t *)text, (uint16_t)length);
     }
+    length = snprintf(text, sizeof(text),
+        "commutation=%s hall_used=%u step=%u interval_us=%lu\r\n",
+        (status.open_loop_test != 0U) ? "OPEN_LOOP_TEST" : "HALL",
+        (unsigned)(status.open_loop_test == 0U),
+        (unsigned)status.commutation_step,
+        (unsigned long)status.commutation_interval_ticks * 50UL);
+    if (length > 0 && length < (int)sizeof(text)) {
+        (void)console_transmit((const uint8_t *)text, (uint16_t)length);
+    }
     debug_bkin();
+}
+
+static void console_motor_speed_range(void)
+{
+    char text[96];
+    (void)snprintf(text, sizeof(text),
+        "MOTOR START default is %u%% duty; MOTOR SPEED accepts 0 or 8..%u%%.\r\n",
+        (unsigned)UART_MOTOR_DEFAULT_PERCENT, (unsigned)UART_MOTOR_MAX_PERCENT);
+    console_write(text);
 }
 
 static void console_help(void)
 {
-    console_write("Commands (CR/LF): MOTOR SPEED 8..100 | MOTOR START/STOP | "
+    console_write("Commands (CR/LF): MOTOR SPEED n | MOTOR START/STOP | "
                   "MOTOR DIR FWD/REV | DC SPEED 0..100 | DC START/STOP | "
                   "DC DIR FWD/REV | SERVO ANGLE -60..60 | MODE CAN/UART | "
                   "STATUS | BKIN | FAULT CLEAR | HELP\r\n");
-    console_write("Speed is open-loop duty percent, not RPM. 0 stops; 1..7 is invalid.\r\n");
+    console_motor_speed_range();
+#if MOTOR_OPEN_LOOP_TEST
+    console_write("Six-step open-loop; Hall prints every 100 ms while running, "
+                  "commutation interval is 100 ms.\r\n");
+#endif
     console_write("DC uses PA4/PA5 direction and PB1 PWM; direction changes stop first.\r\n");
 }
 
@@ -314,9 +343,8 @@ static void console_process_line(void)
             if (uart_control_active == 0U) {
                 Bldc_EmergencyStop();
                 uart_motor_running = 0U;
-                uart_motor_speed_percent = 0U;
                 uart_control_active = 1U;
-                console_write("OK control=UART; set speed and start explicitly\r\n");
+                console_write("OK control=UART; send MOTOR START to run\r\n");
             } else {
                 console_write("OK already in UART mode\r\n");
             }
@@ -324,7 +352,6 @@ static void console_process_line(void)
             if (uart_control_active != 0U) {
                 uart_motor_running = 0U;
                 uart_control_active = 0U;
-                uart_motor_speed_percent = 0U;
                 Bldc_EmergencyStop();
                 console_write("OK UART target stopped; control=CAN, waiting for a CAN command\r\n");
             } else {
@@ -343,8 +370,19 @@ static void console_process_line(void)
         }
         if (strcmp(argument, "START") == 0 && !console_has_extra(&cursor)) {
             select_uart_control();
+#if MOTOR_OPEN_LOOP_TEST
+            {
+                BldcStatus status;
+                Bldc_GetStatus(&status);
+                if (status.fault != BLDC_FAULT_NONE) {
+                    console_write("ERR motor fault latched; send MOTOR STOP then FAULT CLEAR\r\n");
+                    return;
+                }
+            }
+#endif
             if (uart_motor_speed_percent < 8U) {
-                console_write("ERR set MOTOR SPEED 8..100 first\r\n");
+                console_write("ERR motor speed is zero. ");
+                console_motor_speed_range();
             } else {
                 uart_motor_running = 1U;
                 console_write("OK motor start requested\r\n");
@@ -357,9 +395,10 @@ static void console_process_line(void)
         } else if (strcmp(argument, "SPEED") == 0) {
             argument = console_next_token(&cursor);
             if (argument == NULL || console_has_extra(&cursor) ||
-                !console_parse_uint(argument, 100U, &value) ||
+                !console_parse_uint(argument, UART_MOTOR_MAX_PERCENT, &value) ||
                 (value != 0U && value < 8U)) {
-                console_write("ERR speed must be 0 or 8..100 percent\r\n");
+                console_write("ERR ");
+                console_motor_speed_range();
                 return;
             }
             select_uart_control();
@@ -550,6 +589,32 @@ static void fault_led_task(uint32_t now)
     }
 }
 
+static void hall_print_task(uint32_t now)
+{
+    BldcStatus status;
+    char text[24];
+    int length;
+
+    Bldc_GetStatus(&status);
+    if (status.open_loop_test == 0U || status.state != BLDC_RUNNING) {
+        hall_print_active = 0U;
+        return;
+    }
+    if (hall_print_active == 0U) {
+        hall_print_active = 1U;
+        last_hall_print_ms = now;
+        return;
+    }
+    if ((uint32_t)(now - last_hall_print_ms) < 100U) {
+        return;
+    }
+    last_hall_print_ms = now;
+    length = snprintf(text, sizeof(text), "HALL=%u\r\n", (unsigned)status.hall);
+    if (length > 0 && length < (int)sizeof(text)) {
+        (void)console_transmit((const uint8_t *)text, (uint16_t)length);
+    }
+}
+
 HAL_StatusTypeDef MotorApp_Init(void)
 {
     static const uint8_t greeting[] =
@@ -559,11 +624,13 @@ HAL_StatusTypeDef MotorApp_Init(void)
     console_overflow = 0U;
     uart_control_active = 0U;
     uart_motor_running = 0U;
-    uart_motor_speed_percent = 0U;
+    uart_motor_speed_percent = UART_MOTOR_DEFAULT_PERCENT;
     uart_motor_direction = 1;
     brushed_motor_running = 0U;
     brushed_motor_speed_percent = 0U;
     brushed_motor_direction = 1;
+    hall_print_active = 0U;
+    last_hall_print_ms = 0U;
     HAL_GPIO_WritePin(RS485_DIR_GPIO_Port, RS485_DIR_Pin, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(FAULT_LED_GPIO_Port, FAULT_LED_Pin, GPIO_PIN_RESET);
     led_fault = 0U;
@@ -605,6 +672,7 @@ void MotorApp_Process(void)
     }
     now = HAL_GetTick();
     uart_motor_task(now);
+    hall_print_task(now);
     CanBus_Task(now);
     fault_led_task(now);
 }

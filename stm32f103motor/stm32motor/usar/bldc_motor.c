@@ -24,7 +24,11 @@ static const Phase phases[7] = {
     {0x0041U, 0x5068U, 0x0000U}, /* U+ V- */
     {0x0410U, 0x6800U, 0x0050U}  /* V+ W- */
 };
+#if MOTOR_OPEN_LOOP_TEST
+static const uint8_t open_loop_phases[6] = {5U, 4U, 6U, 2U, 3U, 1U};
+#else
 static const uint8_t reverse_phase[7] = {0U, 6U, 5U, 4U, 3U, 2U, 1U};
+#endif
 
 static volatile BldcStatus motor;
 static volatile BldcBreakDiagnostic break_diagnostic;
@@ -41,10 +45,14 @@ static uint32_t adc_sum;
 static uint16_t adc_samples;
 static uint16_t adc_missing_ticks;
 static uint16_t state_ticks;
+#if MOTOR_OPEN_LOOP_TEST
+static uint16_t commutation_ticks;
+#else
 static uint32_t stall_ticks;
+static uint8_t previous_hall;
+#endif
 static uint8_t millisecond_divider;
 static uint8_t voltage_bad_ms;
-static uint8_t previous_hall;
 static int8_t direction;
 
 static void delay_us(uint16_t us)
@@ -65,6 +73,7 @@ static uint8_t read_hall(void)
     return (uint8_t)((pb0 << 2U) | (pa7 << 1U) | pa6);
 }
 
+#if !MOTOR_OPEN_LOOP_TEST
 static uint8_t read_stable_hall(uint8_t *hall)
 {
     uint8_t a = read_hall();
@@ -75,6 +84,7 @@ static uint8_t read_stable_hall(uint8_t *hall)
     *hall = read_hall();
     return (uint8_t)((a == b) && (b == *hall));
 }
+#endif
 
 static void outputs_off(void)
 {
@@ -84,6 +94,11 @@ static void outputs_off(void)
     TIM1->CCR2 = 0U;
     TIM1->CCR3 = 0U;
     motor.duty_ticks = 0U;
+#if MOTOR_OPEN_LOOP_TEST
+    motor.commutation_step = 0U;
+    motor.commutation_interval_ticks = 0U;
+    commutation_ticks = 0U;
+#endif
 }
 
 static void latch_fault(BldcFault fault)
@@ -124,8 +139,10 @@ static void stop_motor(void)
 {
     outputs_off();
     motor.state = BLDC_STOPPED;
+#if !MOTOR_OPEN_LOOP_TEST
     previous_hall = 0U;
     stall_ticks = 0U;
+#endif
     state_ticks = 0U;
 }
 
@@ -157,9 +174,13 @@ static uint8_t enable_outputs(void)
     return enabled;
 }
 
-static void apply_phase(uint8_t hall)
+static void apply_phase(uint8_t index)
 {
-    const Phase *phase = &phases[(direction > 0) ? hall : reverse_phase[hall]];
+#if MOTOR_OPEN_LOOP_TEST
+    const Phase *phase = &phases[index];
+#else
+    const Phase *phase = &phases[(direction > 0) ? index : reverse_phase[index]];
+#endif
     /* Disconnect every channel before changing forced/PWM output modes.
      * Gate-driver inputs must have pull-downs for the disconnected interval. */
     TIM1->CCER = 0U;
@@ -169,6 +190,72 @@ static void apply_phase(uint8_t hall)
     TIM1->CCER = phase->ccer;
     /* Never re-enable MOE here: a higher-priority Break may have cleared it. */
 }
+
+#if MOTOR_OPEN_LOOP_TEST
+/* Hall is sampled for diagnostics only; six-step timing is fixed at 100 ms. */
+static void open_loop_tick(int8_t requested_direction, uint16_t duty)
+{
+    uint8_t next_step;
+
+    if (motor.state == BLDC_RUNNING && requested_direction != direction) {
+        outputs_off();
+        motor.state = BLDC_COASTING;
+        state_ticks = MOTOR_REVERSE_COAST_TICKS;
+        return;
+    }
+    if (motor.state == BLDC_COASTING) {
+        if (state_ticks != 0U) {
+            state_ticks--;
+        }
+        if (state_ticks != 0U) {
+            return;
+        }
+        motor.state = BLDC_STOPPED;
+    }
+    if (motor.state == BLDC_STOPPED) {
+        if ((motor.vbus_adc <= MOTOR_VBUS_UNDERVOLTAGE_ADC) ||
+            (motor.vbus_adc > MOTOR_VBUS_OVERVOLTAGE_ADC)) {
+            return;
+        }
+        direction = requested_direction;
+        TIM1->CCER = 0U;
+        TIM1->CCR1 = duty;
+        TIM1->CCR2 = duty;
+        TIM1->CCR3 = duty;
+        TIM1->EGR = TIM_EGR_UG;
+        __HAL_TIM_CLEAR_FLAG(&htim1, TIM_FLAG_UPDATE);
+        motor.duty_ticks = duty;
+        motor.commutation_step = 1U;
+        motor.commutation_interval_ticks = MOTOR_OPEN_LOOP_COMMUTATION_TICKS;
+        commutation_ticks = MOTOR_OPEN_LOOP_COMMUTATION_TICKS;
+        motor.state = BLDC_RUNNING;
+        apply_phase(open_loop_phases[0]);
+        (void)enable_outputs();
+        return;
+    }
+    motor.duty_ticks = duty;
+    TIM1->CCR1 = duty;
+    TIM1->CCR2 = duty;
+    TIM1->CCR3 = duty;
+    if (motor.state == BLDC_RUNNING) {
+        if (commutation_ticks != 0U) {
+            commutation_ticks--;
+        }
+        if (commutation_ticks != 0U) {
+            return;
+        }
+        next_step = motor.commutation_step;
+        if (direction > 0) {
+            next_step = (next_step >= 6U) ? 1U : (uint8_t)(next_step + 1U);
+        } else {
+            next_step = (next_step <= 1U) ? 6U : (uint8_t)(next_step - 1U);
+        }
+        motor.commutation_step = next_step;
+        commutation_ticks = MOTOR_OPEN_LOOP_COMMUTATION_TICKS;
+        apply_phase(open_loop_phases[next_step - 1U]);
+    }
+}
+#endif
 
 static void sample_voltage(void)
 {
@@ -251,6 +338,10 @@ static void voltage_protection_1ms(void)
 HAL_StatusTypeDef Bldc_Init(void)
 {
     memset((void *)&motor, 0, sizeof(motor));
+    motor.open_loop_test = MOTOR_OPEN_LOOP_TEST;
+#if MOTOR_OPEN_LOOP_TEST
+    motor.hall = read_hall();
+#endif
     memset((void *)&break_diagnostic, 0, sizeof(break_diagnostic));
     requested_mv = 0;
     command_seen = 0U;
@@ -263,10 +354,12 @@ HAL_StatusTypeDef Bldc_Init(void)
     adc_samples = 0U;
     adc_missing_ticks = 0U;
     state_ticks = 0U;
+#if !MOTOR_OPEN_LOOP_TEST
     stall_ticks = 0U;
+    previous_hall = 0U;
+#endif
     millisecond_divider = 0U;
     voltage_bad_ms = 0U;
-    previous_hall = 0U;
     direction = 1;
     outputs_off();
     /* Inactive/off-state outputs low; do not change CubeMX Break polarity. */
@@ -317,7 +410,11 @@ void Bldc_FastTick(void)
     int32_t voltage = requested_mv;
     int8_t requested_direction = (voltage < 0) ? -1 : 1;
     uint32_t duty;
+#if !MOTOR_OPEN_LOOP_TEST
     uint8_t hall;
+#else
+    motor.hall = read_hall();
+#endif
 
     sample_voltage();
     if (++millisecond_divider >= 20U) {
@@ -342,10 +439,19 @@ void Bldc_FastTick(void)
     if (duty > MOTOR_MAX_DUTY_TICKS) {
         duty = MOTOR_MAX_DUTY_TICKS;
     }
+#if MOTOR_OPEN_LOOP_TEST
+    /* Enforce the bench limit here for every caller, including CAN commands. */
+    if (duty > MOTOR_OPEN_LOOP_MAX_DUTY_TICKS) {
+        duty = MOTOR_OPEN_LOOP_MAX_DUTY_TICKS;
+    }
+#endif
     if (duty < MOTOR_MIN_DUTY_TICKS) {
         stop_motor();
         return;
     }
+#if MOTOR_OPEN_LOOP_TEST
+    open_loop_tick(requested_direction, (uint16_t)duty);
+#else
     if ((motor.state == BLDC_RUNNING || motor.state == BLDC_PRECHARGE) &&
         (requested_direction != direction)) {
         outputs_off();
@@ -413,6 +519,7 @@ void Bldc_FastTick(void)
     } else if (++stall_ticks >= MOTOR_STALL_TIMEOUT_TICKS) {
         latch_fault(BLDC_FAULT_HALL);
     }
+#endif
     /* An IRQ may have preempted above. Keep the software state off as well. */
     if (motor.fault != BLDC_FAULT_NONE) {
         stop_motor();
@@ -464,18 +571,29 @@ void Bldc_GetStatus(BldcStatus *status)
 HAL_StatusTypeDef Bldc_ClearFault(void)
 {
     uint32_t key = __get_PRIMASK();
+#if !MOTOR_OPEN_LOOP_TEST
     uint8_t hall;
+#endif
     __disable_irq();
+#if !MOTOR_OPEN_LOOP_TEST
     hall = read_hall();
+#endif
     if (requested_mv != 0 || motor.voltage_ready == 0U || adc_dma_error != 0U ||
         motor.vbus_adc <= MOTOR_VBUS_UNDERVOLTAGE_ADC ||
         motor.vbus_adc > MOTOR_VBUS_OVERVOLTAGE_ADC ||
-        (GPIOB->IDR & GPIO_PIN_12) == 0U || hall == 0U || hall == 7U) {
+        (GPIOB->IDR & GPIO_PIN_12) == 0U
+#if !MOTOR_OPEN_LOOP_TEST
+        || hall == 0U || hall == 7U
+#endif
+        ) {
         __set_PRIMASK(key);
         return HAL_ERROR;
     }
     stop_motor();
     motor.fault = BLDC_FAULT_NONE;
+#if MOTOR_OPEN_LOOP_TEST
+    motor.hall = read_hall();
+#endif
     voltage_bad_ms = 0U;
     memset((void *)&break_diagnostic, 0, sizeof(break_diagnostic));
     __HAL_TIM_CLEAR_FLAG(&htim1, TIM_FLAG_BREAK);

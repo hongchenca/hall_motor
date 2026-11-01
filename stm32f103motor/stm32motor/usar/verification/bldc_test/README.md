@@ -1,6 +1,6 @@
 # BLDC 模块可重放测试
 
-本目录用 ARMCC 将真实 `usar/bldc_motor.c` 按正常生产配置编译，不添加旁路或测试功能宏覆盖，在 Unicorn 中执行 Cortex-M3 Thumb 指令；仅替换 HAL、外设寄存器存储和输入注入。未复制换相或状态机算法。
+本目录用 ARMCC 将真实 `usar/bldc_motor.c` 以 `MOTOR_OPEN_LOOP_TEST=0` 编译，明确验证保留的正常霍尔换相模式；不覆盖或旁路任何保护配置。在 Unicorn 中执行 Cortex-M3 Thumb 指令；仅替换 HAL、外设寄存器存储和输入注入。未复制换相或状态机算法。独立的定时开环测试见 `../open_loop_test/`。
 
 在固件工程根目录（`stm32f103motor/stm32motor`）的 PowerShell 中运行，确保 Python 已加入 PATH：
 

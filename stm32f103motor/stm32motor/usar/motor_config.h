@@ -23,4 +23,32 @@
 #define MOTOR_STALL_TIMEOUT_TICKS      65535U /* approximately 3.28 s */
 #define MOTOR_REVERSE_COAST_TICKS      2000U  /* all outputs off before reversal */
 
+/* Time-driven six-step bench test. Set to 0 for the original Hall controller.
+ * Tick units below are 50 us. This is not a sensorless closed-loop controller. */
+#ifndef MOTOR_OPEN_LOOP_TEST
+#define MOTOR_OPEN_LOOP_TEST            1U
+#endif
+#define MOTOR_OPEN_LOOP_MAX_DUTY_PERCENT 10U
+#define MOTOR_OPEN_LOOP_COMMUTATION_TICKS 100U
+#define MOTOR_OPEN_LOOP_MAX_DUTY_TICKS  \
+    ((MOTOR_PWM_TICKS * MOTOR_OPEN_LOOP_MAX_DUTY_PERCENT) / 100U)
+
+#if (MOTOR_OPEN_LOOP_TEST != 0U) && (MOTOR_OPEN_LOOP_TEST != 1U)
+#error MOTOR_OPEN_LOOP_TEST_must_be_0_or_1
+#endif
+#if (MOTOR_OPEN_LOOP_MAX_DUTY_PERCENT == 0U) || \
+    (MOTOR_OPEN_LOOP_MAX_DUTY_PERCENT > 10U) || \
+    (MOTOR_OPEN_LOOP_MAX_DUTY_TICKS < MOTOR_MIN_DUTY_TICKS) || \
+    (MOTOR_OPEN_LOOP_MAX_DUTY_TICKS > MOTOR_MAX_DUTY_TICKS)
+#error Invalid_open_loop_duty_limit
+#endif
+#if (MOTOR_PRECHARGE_TICKS == 0U) || (MOTOR_PRECHARGE_TICKS > 65535U) || \
+    (MOTOR_REVERSE_COAST_TICKS == 0U) || (MOTOR_REVERSE_COAST_TICKS > 65535U)
+#error Invalid_open_loop_state_interval
+#endif
+#if (MOTOR_OPEN_LOOP_COMMUTATION_TICKS == 0U) || \
+    (MOTOR_OPEN_LOOP_COMMUTATION_TICKS > 65535U)
+#error Invalid_open_loop_commutation_interval
+#endif
+
 #endif

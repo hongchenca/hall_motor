@@ -19,6 +19,7 @@ uint32_t mock_hal_timer_result, mock_hal_timer_it_result;
 uint32_t mock_hal_calibration_result, mock_hal_adc_result;
 uint32_t test_snapshot[23];
 uint32_t test_break_diagnostic[7];
+uint32_t test_open_loop_snapshot[3];
 
 uint32_t Mock_GetPrimask(void) { return mock_primask; }
 void Mock_SetPrimask(uint32_t key) { mock_primask = key; }
@@ -225,6 +226,19 @@ void Test_Snapshot(void)
     test_snapshot[20] = mock_dma_channel.CCR;
     test_snapshot[21] = (mock_gpiob.IDR & GPIO_PIN_12) != 0U;
     test_snapshot[22] = (mock_tim1.SR & TIM_SR_BIF) != 0U;
+}
+
+void Test_OpenLoopSnapshot(void)
+{
+#if defined(MOTOR_OPEN_LOOP_TEST) && MOTOR_OPEN_LOOP_TEST
+    BldcStatus s;
+    Bldc_GetStatus(&s);
+    test_open_loop_snapshot[0] = s.open_loop_test;
+    test_open_loop_snapshot[1] = s.commutation_step;
+    test_open_loop_snapshot[2] = s.commutation_interval_ticks;
+#else
+    memset(test_open_loop_snapshot, 0, sizeof(test_open_loop_snapshot));
+#endif
 }
 
 /* No CRT is needed by Unicorn. Retain the actual module through --no_remove. */
