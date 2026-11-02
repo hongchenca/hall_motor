@@ -4,15 +4,18 @@
 #include "can_bus.h"
 #include "actuators.h"
 #include "mt6v10_modbus.h"
+#include "motor_motion.h"
 #include "rs485_port.h"
 #include "usart.h"
 #include <stdio.h>
 #include <string.h>
 
 #define CONSOLE_LINE_CAPACITY 64U
-#define CONSOLE_BAUD_RATE 115200U
-#define CONSOLE_BITS_PER_BYTE 10U
-#define CONSOLE_TX_MARGIN_MS 10U
+#define CONSOLE_TX_CAPACITY 1024U
+#define MOTOR_CONTROL_TICKS_PER_MS 20U
+#define MOTOR_OPEN_LOOP_COMMUTATION_MS \
+    ((MOTOR_OPEN_LOOP_COMMUTATION_TICKS + MOTOR_CONTROL_TICKS_PER_MS - 1U) / \
+     MOTOR_CONTROL_TICKS_PER_MS)
 #if MOTOR_OPEN_LOOP_TEST
 #define UART_MOTOR_MAX_PERCENT MOTOR_OPEN_LOOP_MAX_DUTY_PERCENT
 #else
@@ -27,24 +30,40 @@ static uint8_t led_edge;
 static char console_line[CONSOLE_LINE_CAPACITY];
 static uint8_t console_length;
 static uint8_t console_overflow;
+static uint8_t console_tx[CONSOLE_TX_CAPACITY];
+static uint16_t console_tx_read, console_tx_write;
 static uint8_t uart_control_active;
 static uint8_t uart_motor_running;
 static uint8_t uart_motor_speed_percent;
 static int8_t uart_motor_direction;
+static uint8_t uart_motion_control;
 static uint8_t brushed_motor_running;
 static uint8_t brushed_motor_speed_percent;
 static int8_t brushed_motor_direction;
-static uint32_t last_hall_print_ms;
-static uint8_t hall_print_active;
 
 static HAL_StatusTypeDef console_transmit(const uint8_t *data, uint16_t length)
 {
-    uint32_t wire_time_ms =
-        (((uint32_t)length * CONSOLE_BITS_PER_BYTE * 1000U) +
-         CONSOLE_BAUD_RATE - 1U) / CONSOLE_BAUD_RATE;
+    uint16_t used = (uint16_t)((console_tx_write - console_tx_read) &
+                              (CONSOLE_TX_CAPACITY - 1U));
+    if (length > CONSOLE_TX_CAPACITY - 1U - used) { return HAL_BUSY; }
+    while (length-- != 0U) {
+        console_tx[console_tx_write] = *data++;
+        console_tx_write = (uint16_t)((console_tx_write + 1U) &
+                                     (CONSOLE_TX_CAPACITY - 1U));
+    }
+    return HAL_OK;
+}
 
-    return HAL_UART_Transmit(&huart3, (uint8_t *)data, length,
-                             wire_time_ms + CONSOLE_TX_MARGIN_MS);
+static void console_tx_task(void)
+{
+    uint8_t budget = 16U;
+    /* Diagnostic text must never block RS485 sampling or output control. */
+    while (budget-- != 0U && console_tx_read != console_tx_write &&
+           (USART3->SR & USART_SR_TXE) != 0U) {
+        USART3->DR = console_tx[console_tx_read];
+        console_tx_read = (uint16_t)((console_tx_read + 1U) &
+                                    (CONSOLE_TX_CAPACITY - 1U));
+    }
 }
 
 static uint8_t read_hall_gpio(uint32_t *port_a, uint32_t *port_b)
@@ -141,6 +160,27 @@ static uint8_t console_parse_servo_angle(const char *text, int16_t *angle)
     return 1U;
 }
 
+#if MOTOR_OPEN_LOOP_TEST
+static uint8_t console_parse_degrees(const char *text, int32_t *degrees)
+{
+    int32_t value = 0;
+    int8_t sign = 1;
+    if (*text == '-' || *text == '+') {
+        sign = *text == '-' ? -1 : 1;
+        text++;
+    }
+    if (*text < '0' || *text > '9') { return 0U; }
+    while (*text >= '0' && *text <= '9') {
+        int32_t digit = *text++ - '0';
+        if (value > (MOTION_MAX_DEGREES - digit) / 10) { return 0U; }
+        value = value * 10 + digit;
+    }
+    if (*text != '\0') { return 0U; }
+    *degrees = value * sign;
+    return 1U;
+}
+#endif
+
 static uint8_t console_has_extra(char **cursor)
 {
     return (uint8_t)(console_next_token(cursor) != NULL);
@@ -150,9 +190,56 @@ static void select_uart_control(void)
 {
     if (uart_control_active == 0U) {
         Bldc_EmergencyStop();
+        MotorMotion_Stop();
         uart_motor_running = 0U;
         uart_control_active = 1U;
     }
+}
+
+static void stop_uart_motor(void)
+{
+    uart_motor_running = 0U;
+    MotorMotion_Stop();
+    Bldc_EmergencyStop();
+}
+
+static const char *motion_state_name(MotorMotionState state)
+{
+    switch (state) {
+    case MOTION_WAIT_STOP: return "WAIT_STOP";
+    case MOTION_SPEED: return "SPEED";
+    case MOTION_POSITION: return "POSITION";
+    case MOTION_SETTLING: return "SETTLING";
+    case MOTION_DONE: return "DONE";
+    case MOTION_FAULT: return "FAULT";
+    default: return "IDLE";
+    }
+}
+
+static const char *motion_fault_name(MotorMotionFault fault)
+{
+    switch (fault) {
+    case MOTION_ENCODER_LOST: return "ENC_LOST";
+    case MOTION_ENCODER_JUMP: return "ENC_JUMP";
+    case MOTION_DRIVER_FAULT: return "DRIVER";
+    case MOTION_TRACKING_ERROR: return "TRACKING";
+    case MOTION_MOVE_TIMEOUT: return "MOVE_TIMEOUT";
+    case MOTION_STOP_TIMEOUT: return "STOP_TIMEOUT";
+    default: return "NONE";
+    }
+}
+
+static void update_motion_feedback(uint32_t now)
+{
+    BldcStatus status;
+    Mt6v10Status encoder;
+    Bldc_GetStatus(&status);
+    Mt6v10_GetStatus(&encoder);
+    MotorMotion_Update(now, &encoder,
+        (uint8_t)(status.voltage_ready != 0U &&
+            status.vbus_adc > MOTOR_VBUS_UNDERVOLTAGE_ADC &&
+            status.vbus_adc <= MOTOR_VBUS_OVERVOLTAGE_ADC),
+        (uint8_t)(status.fault != BLDC_FAULT_NONE));
 }
 
 static const char *break_source_name(BldcBreakSource source)
@@ -208,6 +295,7 @@ static void debug_status(void)
 {
     BldcStatus status;
     Mt6v10Status encoder;
+    MotorMotionStatus motion;
     char text[384];
     int length;
     uint32_t gpioa;
@@ -215,8 +303,9 @@ static void debug_status(void)
     uint8_t hall_raw = read_hall_gpio(&gpioa, &gpiob);
     Bldc_GetStatus(&status);
     Mt6v10_GetStatus(&encoder);
+    MotorMotion_GetStatus(&motion);
     length = snprintf(text, sizeof(text),
-        "control=%s uart_target=%s direction=%s duty_request=%u%% state=%u fault=%u "
+        "control=%s uart_target=%s direction_request=%s duty_request=%u%% state=%u fault=%u "
         "vbus=%lu mV adc=%u pa2=%u duty=%u/3200 hall=%u hall_raw=%u "
         "(PB0:PA7:PA6=%u%u%u) timeout=%u dc=%s dir=%s speed=%u%% pwm=%u/3200 "
         "enc=%s angle=%ldmrad rpm_x10=%d raw=%u turns=%d crc=%lu timeout=%lu rx_ovr=%lu\r\n",
@@ -256,6 +345,19 @@ static void debug_status(void)
     if (length > 0 && length < (int)sizeof(text)) {
         (void)console_transmit((const uint8_t *)text, (uint16_t)length);
     }
+    length = snprintf(text, sizeof(text),
+        "motion=%s state=%s error=%s drive=%s rpm_limit=%u speed_rpm_x10=%ld "
+        "ramp_rpm_x10=%ld pos_deg_x10=%ld target_deg_x10=%ld ref_valid=%u\r\n",
+        uart_motion_control != 0U ? "ENCODER" : "DUTY",
+        motion_state_name(motion.state), motion_fault_name(motion.fault),
+        uart_motion_control == 0U ? "N/A" : (motion.drive_direction == 0 ? "OFF" :
+            (motion.drive_direction < 0 ? "REV" : "FWD")),
+        (unsigned)motion.rpm_limit, (long)motion.speed_rpm_x10,
+        (long)motion.ramp_rpm_x10, (long)motion.position_deg_x10,
+        (long)motion.target_deg_x10, (unsigned)motion.reference_valid);
+    if (length > 0 && length < (int)sizeof(text)) {
+        (void)console_transmit((const uint8_t *)text, (uint16_t)length);
+    }
     debug_bkin();
 }
 
@@ -270,14 +372,23 @@ static void console_motor_speed_range(void)
 
 static void console_help(void)
 {
+#if MOTOR_OPEN_LOOP_TEST
+    char timing_text[112];
+#endif
     console_write("Commands (CR/LF): MOTOR SPEED n | MOTOR START/STOP | "
                   "MOTOR DIR FWD/REV | DC SPEED 0..100 | DC START/STOP | "
                   "DC DIR FWD/REV | SERVO ANGLE -60..60 | MODE CAN/UART | "
                   "STATUS | BKIN | FAULT CLEAR | HELP\r\n");
     console_motor_speed_range();
 #if MOTOR_OPEN_LOOP_TEST
-    console_write("Six-step open-loop; Hall prints every 100 ms while running, "
-                  "commutation interval is 100 ms.\r\n");
+    console_write("Output shaft: MOTOR RPM 0|3..350 | MOTOR ZERO | "
+                  "MOTOR MOVE degrees | MOTOR POS degrees (-360000..360000).\r\n");
+    console_write("RPM sets speed/position limit; START runs; MOVE/POS start a move. "
+                  "FWD positive; ZERO while stopped; arrival releases PWM.\r\n");
+    (void)snprintf(timing_text, sizeof(timing_text),
+        "Default duty/CAN mode: %lu ms six-step; RPM/position mode varies the interval.\r\n",
+        (unsigned long)MOTOR_OPEN_LOOP_COMMUTATION_MS);
+    console_write(timing_text);
 #endif
     console_write("DC uses PA4/PA5 direction and PB1 PWM; direction changes stop first.\r\n");
 }
@@ -285,7 +396,14 @@ static void console_help(void)
 static void console_clear_fault(void)
 {
     if (Bldc_ClearFault() == HAL_OK) {
-        console_write("OK fault cleared\r\n");
+        MotorMotionStatus motion;
+        update_motion_feedback(HAL_GetTick());
+        MotorMotion_GetStatus(&motion);
+        if (motion.fault != MOTION_OK && MotorMotion_ClearFault() == 0U) {
+            console_write("ERR motion clear requires STOP, fresh encoder and healthy supply\r\n");
+        } else {
+            console_write("OK fault cleared; explicit START or MOVE/POS required\r\n");
+        }
     } else {
         console_write("ERR fault clear blocked\r\n");
     }
@@ -341,8 +459,7 @@ static void console_process_line(void)
             console_write("ERR usage: MODE CAN|UART\r\n");
         } else if (strcmp(argument, "UART") == 0) {
             if (uart_control_active == 0U) {
-                Bldc_EmergencyStop();
-                uart_motor_running = 0U;
+                stop_uart_motor();
                 uart_control_active = 1U;
                 console_write("OK control=UART; send MOTOR START to run\r\n");
             } else {
@@ -350,9 +467,9 @@ static void console_process_line(void)
             }
         } else if (strcmp(argument, "CAN") == 0) {
             if (uart_control_active != 0U) {
-                uart_motor_running = 0U;
+                stop_uart_motor();
+                uart_motion_control = 0U;
                 uart_control_active = 0U;
-                Bldc_EmergencyStop();
                 console_write("OK UART target stopped; control=CAN, waiting for a CAN command\r\n");
             } else {
                 console_write("OK already in CAN mode\r\n");
@@ -368,8 +485,70 @@ static void console_process_line(void)
             console_write("ERR usage: MOTOR START|STOP|SPEED n|DIR FWD|REV\r\n");
             return;
         }
+#if MOTOR_OPEN_LOOP_TEST
+        if (strcmp(argument, "RPM") == 0) {
+            argument = console_next_token(&cursor);
+            if (argument == NULL || console_has_extra(&cursor) ||
+                !console_parse_uint(argument, MOTION_MAX_RPM, &value) ||
+                (value != 0U && value < MOTION_MIN_RPM)) {
+                console_write("ERR usage: MOTOR RPM 0|3..350 (output shaft rpm)\r\n");
+                return;
+            }
+            select_uart_control();
+            if (uart_motion_control == 0U) { stop_uart_motor(); }
+            uart_motion_control = 1U;
+            (void)MotorMotion_SetRpm(value);
+            if (value == 0U) { stop_uart_motor(); }
+            console_write("OK output rpm limit set; START to run if stopped\r\n");
+            return;
+        }
+        if (strcmp(argument, "ZERO") == 0 && !console_has_extra(&cursor)) {
+            BldcStatus status;
+            Bldc_GetStatus(&status);
+            if (status.state != BLDC_STOPPED || uart_motor_running != 0U ||
+                MotorMotion_Zero() == 0U) {
+                console_write("ERR ZERO requires stopped motor and fresh stationary encoder\r\n");
+            } else { console_write("OK output position zero set (RAM only)\r\n"); }
+            return;
+        }
+        if (strcmp(argument, "MOVE") == 0 || strcmp(argument, "POS") == 0) {
+            int32_t degrees;
+            uint8_t relative = (uint8_t)(strcmp(argument, "MOVE") == 0);
+            argument = console_next_token(&cursor);
+            if (argument == NULL || console_has_extra(&cursor) ||
+                console_parse_degrees(argument, &degrees) == 0U) {
+                console_write("ERR MOVE/POS requires integer degrees -360000..360000\r\n");
+                return;
+            }
+            select_uart_control();
+            if (uart_motor_speed_percent < 8U ||
+                MotorMotion_Move(degrees, relative) == 0U) {
+                console_write("ERR move blocked; check STATUS, encoder, zero, RPM and fault\r\n");
+                return;
+            }
+            Bldc_EmergencyStop();
+            uart_motion_control = 1U;
+            uart_motor_running = 1U;
+            console_write("OK output position move started\r\n");
+            return;
+        }
+#endif
         if (strcmp(argument, "START") == 0 && !console_has_extra(&cursor)) {
             select_uart_control();
+            if (uart_motion_control != 0U) {
+                if (uart_motor_speed_percent < 8U) {
+                    console_write("ERR set MOTOR SPEED 8..100 duty before starting\r\n");
+                    return;
+                }
+                MotorMotion_SetDirection(uart_motor_direction);
+                if (MotorMotion_Start() != 0U) {
+                    uart_motor_running = 1U;
+                    console_write("OK output speed control started\r\n");
+                } else {
+                    console_write("ERR start blocked; check encoder, RPM, supply and fault\r\n");
+                }
+                return;
+            }
 #if MOTOR_OPEN_LOOP_TEST
             {
                 BldcStatus status;
@@ -389,8 +568,7 @@ static void console_process_line(void)
             }
         } else if (strcmp(argument, "STOP") == 0 && !console_has_extra(&cursor)) {
             select_uart_control();
-            uart_motor_running = 0U;
-            Bldc_EmergencyStop();
+            stop_uart_motor();
             console_write("OK motor stopped\r\n");
         } else if (strcmp(argument, "SPEED") == 0) {
             argument = console_next_token(&cursor);
@@ -404,10 +582,9 @@ static void console_process_line(void)
             select_uart_control();
             uart_motor_speed_percent = (uint8_t)value;
             if (value == 0U) {
-                uart_motor_running = 0U;
-                Bldc_EmergencyStop();
+                stop_uart_motor();
             }
-            console_write("OK motor speed request updated\r\n");
+            console_write("OK motor duty updated; control mode unchanged\r\n");
         } else if (strcmp(argument, "DIR") == 0) {
             argument = console_next_token(&cursor);
             if (argument == NULL || console_has_extra(&cursor) ||
@@ -417,6 +594,13 @@ static void console_process_line(void)
             }
             select_uart_control();
             uart_motor_direction = (strcmp(argument, "REV") == 0) ? -1 : 1;
+            MotorMotion_SetDirection(uart_motor_direction);
+            if (uart_motion_control != 0U) {
+                MotorMotionStatus motion;
+                MotorMotion_GetStatus(&motion);
+                uart_motor_running = motion.active;
+                if (motion.drive_direction == 0) { Bldc_EmergencyStop(); }
+            }
             console_write("OK motor direction request updated\r\n");
         } else {
             console_write("ERR usage: MOTOR START|STOP|SPEED n|DIR FWD|REV\r\n");
@@ -542,6 +726,22 @@ static void uart_motor_task(uint32_t now)
     uint32_t voltage_mv;
     int32_t signed_voltage_mv;
 
+    if (uart_control_active != 0U && uart_motion_control != 0U) {
+        MotorMotionStatus motion;
+        MotorMotion_GetStatus(&motion);
+        uart_motor_running = motion.active;
+        if (motion.drive_direction == 0 || uart_motor_speed_percent < 8U) {
+            Bldc_SetVoltageMv(0, now);
+            return;
+        }
+        Bldc_GetStatus(&status);
+        voltage_mv = (status.vbus_mv * uart_motor_speed_percent + 99U) / 100U;
+        if (voltage_mv > 32767U) { voltage_mv = 32767U; }
+        Bldc_SetCommutationTicks(motion.interval_ticks);
+        Bldc_SetVoltageMv((int16_t)((int32_t)voltage_mv * motion.drive_direction), now);
+        return;
+    }
+
     if (uart_control_active == 0U || uart_motor_running == 0U ||
         uart_motor_speed_percent < 8U) {
         return;
@@ -589,32 +789,6 @@ static void fault_led_task(uint32_t now)
     }
 }
 
-static void hall_print_task(uint32_t now)
-{
-    BldcStatus status;
-    char text[24];
-    int length;
-
-    Bldc_GetStatus(&status);
-    if (status.open_loop_test == 0U || status.state != BLDC_RUNNING) {
-        hall_print_active = 0U;
-        return;
-    }
-    if (hall_print_active == 0U) {
-        hall_print_active = 1U;
-        last_hall_print_ms = now;
-        return;
-    }
-    if ((uint32_t)(now - last_hall_print_ms) < 100U) {
-        return;
-    }
-    last_hall_print_ms = now;
-    length = snprintf(text, sizeof(text), "HALL=%u\r\n", (unsigned)status.hall);
-    if (length > 0 && length < (int)sizeof(text)) {
-        (void)console_transmit((const uint8_t *)text, (uint16_t)length);
-    }
-}
-
 HAL_StatusTypeDef MotorApp_Init(void)
 {
     static const uint8_t greeting[] =
@@ -622,15 +796,16 @@ HAL_StatusTypeDef MotorApp_Init(void)
     app_ready = 0U;
     console_length = 0U;
     console_overflow = 0U;
+    console_tx_read = console_tx_write = 0U;
     uart_control_active = 0U;
     uart_motor_running = 0U;
     uart_motor_speed_percent = UART_MOTOR_DEFAULT_PERCENT;
     uart_motor_direction = 1;
+    uart_motion_control = 0U;
+    MotorMotion_Init();
     brushed_motor_running = 0U;
     brushed_motor_speed_percent = 0U;
     brushed_motor_direction = 1;
-    hall_print_active = 0U;
-    last_hall_print_ms = 0U;
     HAL_GPIO_WritePin(RS485_DIR_GPIO_Port, RS485_DIR_Pin, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(FAULT_LED_GPIO_Port, FAULT_LED_Pin, GPIO_PIN_RESET);
     led_fault = 0U;
@@ -658,12 +833,14 @@ void MotorApp_Process(void)
     if (app_ready == 0U) {
         return;
     }
-    console_task();
     now = HAL_GetTick();
     Mt6v10_Task(now);
     if (Mt6v10_TakeUpdate(&encoder) != 0U) {
         CanBus_SetFeedback(encoder.angle_mrad, encoder.speed_rpm_x10);
     }
+    update_motion_feedback(now);
+    uart_motor_task(now);
+    console_task();
     if (CanBus_TakeCommand(&voltage_mv, &received_ms) != 0U) {
         if (uart_control_active == 0U) {
             /* Keep the ISR receive timestamp; a slow foreground cannot extend it. */
@@ -671,10 +848,12 @@ void MotorApp_Process(void)
         }
     }
     now = HAL_GetTick();
+    /* Recheck command/feedback state after processing a console command. */
+    update_motion_feedback(now);
     uart_motor_task(now);
-    hall_print_task(now);
     CanBus_Task(now);
     fault_led_task(now);
+    console_tx_task();
 }
 
 void MotorApp_EmergencyStop(void)
@@ -682,6 +861,8 @@ void MotorApp_EmergencyStop(void)
     uint32_t key = __get_PRIMASK();
     __disable_irq();
     app_ready = 0U;
+    uart_motor_running = 0U;
+    MotorMotion_Stop();
     brushed_motor_running = 0U;
     CLEAR_BIT(TIM1->BDTR, TIM_BDTR_MOE);
     TIM1->CCER = 0U;

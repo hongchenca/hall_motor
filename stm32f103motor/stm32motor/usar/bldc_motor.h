@@ -58,6 +58,10 @@ typedef struct {
 HAL_StatusTypeDef Bldc_Init(void);
 /* received_ms must be the receive timestamp, not a repeatedly refreshed loop time. */
 void Bldc_SetVoltageMv(int16_t voltage_mv, uint32_t received_ms);
+/* Time-driven mode only: 50 us units, clamped to configured bounds. Changes
+ * apply at startup or the next phase boundary, never shorten an active step.
+ * EmergencyStop restores the default interval; normal Hall mode ignores it. */
+void Bldc_SetCommutationTicks(uint16_t ticks);
 void Bldc_FastTick(void); /* exactly once per TIM1 update (50 us) */
 void Bldc_BreakIrq(void);
 /* Call at the TIM1 Break vector before HAL clears BIF; no UART in the ISR. */

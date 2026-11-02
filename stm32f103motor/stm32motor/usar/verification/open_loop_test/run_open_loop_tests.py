@@ -26,7 +26,7 @@ ELF_PATH = HERE / "open_loop_mock.axf"
 FIELDS = ["open_loop", "step", "interval_ticks"]
 MOE, AOE, BKE, BIE, BIF = boundary.MOE, boundary.AOE, boundary.BKE, boundary.BIE, boundary.BIF
 MISSING = boundary.MISSING
-COMMUTATION_TICKS = 2000
+COMMUTATION_TICKS = 100
 
 # Physical outputs for the test's six steps, not values read from the module.
 # Entries are (CCER, CCMR1, CCMR2 including preserved CH4), in U,V,W order.
@@ -102,7 +102,7 @@ def phase(s, step):
     assert (s["ccer"], s["ccmr1"], s["ccmr2"]) == OUTPUTS[step], s
     assert s["ccer"] & 0x1000 == 0, "CH4 output became enabled"
     assert s["bdtr"] & MOE and s["bdtr"] & BKE and not s["bdtr"] & AOE, s
-    assert 256 <= s["duty"] <= 320, s
+    assert 256 <= s["duty"] <= 3200, s
     assert s["duty"] == s["ccr1"] == s["ccr2"] == s["ccr3"], s
 
 
@@ -122,7 +122,7 @@ def startup_boundaries():
     phase(first_step, 2)
     assert first_step["interval_ticks"] == COMMUTATION_TICKS, first_step
     return {"boot": boot, "immediate_step_1": running,
-            "one_tick_before_100ms": before_step, "first_step_at_100ms": first_step}
+            "one_tick_before_5ms": before_step, "first_step_at_5ms": first_step}
 
 
 def sequence_and_fixed_period(direction):
@@ -170,15 +170,88 @@ def hall_independence():
     return {"matched_traces": compared, "running_over_5_seconds": a}
 
 
+def variable_period(direction):
+    m = Motor()
+    voltage = direction * 5000
+    m.prime()
+    m.call("Bldc_SetCommutationTicks", 250)
+    m.command(voltage)
+    m.one(hall=7)
+    initial = m.snapshot()
+    phase(initial, 1)
+    assert initial["interval_ticks"] == 250, initial
+    m.advance(120, hall=0, refresh=voltage)
+    m.call("Bldc_SetCommutationTicks", 8)
+    m.advance(129, hall=7, refresh=voltage)
+    before_boundary = m.snapshot()
+    phase(before_boundary, 1)
+    assert before_boundary["interval_ticks"] == 250, before_boundary
+    m.one(hall=0)
+    step = 2 if direction > 0 else 6
+    changed = m.snapshot()
+    phase(changed, step)
+    assert changed["interval_ticks"] == 8, changed
+    m.advance(7, hall=7, refresh=voltage)
+    phase(m.snapshot(), step)
+    m.one(hall=0)
+    step = ((step - 1 + direction) % 6) + 1
+    phase(m.snapshot(), step)
+    # Lengthening also takes effect only when the in-flight step completes.
+    m.call("Bldc_SetCommutationTicks", 2000)
+    m.advance(8, hall=7, refresh=voltage)
+    step = ((step - 1 + direction) % 6) + 1
+    phase(m.snapshot(), step)
+    assert m.snapshot()["interval_ticks"] == 2000
+    m.advance(1999, hall=0, refresh=voltage)
+    phase(m.snapshot(), step)
+    m.one(hall=7)
+    phase(m.snapshot(), ((step - 1 + direction) % 6) + 1)
+    return {"direction": direction, "startup_requested_period": initial,
+            "old_period_completed": before_boundary, "new_period": changed,
+            "long_period": m.snapshot()}
+
+
+def period_clamp_and_emergency_reset():
+    result = {}
+    for requested, expected in [(0, 8), (7, 8), (8, 8), (2000, 2000),
+                                (2001, 2000), (65535, 2000)]:
+        m = Motor()
+        m.prime()
+        m.call("Mock_SetPrimask", 1)
+        m.call("Bldc_SetCommutationTicks", requested)
+        assert m.snapshot()["primask"] == 1
+        m.call("Mock_SetPrimask", 0)
+        m.command(5000)
+        m.one(hall=0)
+        s = m.snapshot()
+        phase(s, 1)
+        assert s["interval_ticks"] == expected, s
+        m.call("Bldc_EmergencyStop")
+        off(m.snapshot())
+        m.command(5000)
+        m.one(hall=7)
+        reset = m.snapshot()
+        phase(reset, 1)
+        assert reset["interval_ticks"] == COMMUTATION_TICKS, reset
+        result[str(requested)] = {"clamped_interval": expected,
+                                  "restart_interval": reset["interval_ticks"]}
+    return result
+
+
 def input_duty_limit():
     result = {}
-    for voltage in [5000, 32767, -32768]:
+    # ADC 2708 gives exactly 24000 mV, so expected PWM counts do not depend
+    # on rounding. Test both polarities through the real voltage entrypoint.
+    for voltage, expected in [(4800, 640), (-4800, 640), (12000, 1600),
+                              (-12000, 1600), (24000, 3200), (-24000, 3200),
+                              (32767, 3200), (-32768, 3200)]:
         m = Motor()
-        s = m.run(voltage=voltage, hall=7)
-        assert s["duty"] == 320, s
-        m.advance(COMMUTATION_TICKS, hall=0, refresh=voltage)
+        s = m.start(voltage=voltage, hall=7, sample=2708)
+        assert s["vbus_mv"] == 24000 and s["duty"] == expected, s
+        m.advance(COMMUTATION_TICKS, sample=2708, hall=0, refresh=voltage)
         after = m.snapshot()
         phase(after, 2 if voltage > 0 else 6)
+        assert after["duty"] == expected, after
         result[str(voltage)] = after
     m = Motor()
     m.run(voltage=1900)
@@ -252,7 +325,7 @@ def reversal_coast():
     reversed_state = m.snapshot()
     phase(reversed_state, 6)
     return {"coast": coast, "restart_at_step_1": restarted,
-            "first_reverse_step_after_100ms": reversed_state}
+            "first_reverse_step_after_5ms": reversed_state}
 
 
 def break_lifecycle():
@@ -405,11 +478,14 @@ def initialization_failures():
 def main():
     commands = build()
     cases = [
-        ("start_enters_step_1_and_first_commutation_at_100ms", startup_boundaries),
-        ("forward_six_steps_fixed_100ms_period", lambda: sequence_and_fixed_period(1)),
-        ("reverse_six_steps_fixed_100ms_period", lambda: sequence_and_fixed_period(-1)),
+        ("start_enters_step_1_and_first_commutation_at_5ms", startup_boundaries),
+        ("forward_six_steps_fixed_5ms_period", lambda: sequence_and_fixed_period(1)),
+        ("reverse_six_steps_fixed_5ms_period", lambda: sequence_and_fixed_period(-1)),
+        ("forward_variable_interval_changes_at_phase_boundary", lambda: variable_period(1)),
+        ("reverse_variable_interval_changes_at_phase_boundary", lambda: variable_period(-1)),
+        ("interval_clamps_preserve_irq_mask_and_stop_restores_default", period_clamp_and_emergency_reset),
         ("hall_zero_seven_changed_and_stalled_do_not_control_output", hall_independence),
-        ("signed_voltage_entrypoint_ten_percent_cap", input_duty_limit),
+        ("signed_voltage_20_50_100_percent_and_overrange_clamp", input_duty_limit),
         ("command_timeout_499_500_ms", command_timeout),
         ("command_timeout_uint32_wrap", lambda: command_timeout(True)),
         ("stop_restart_and_zero_command_stop", stop_restart),
@@ -445,7 +521,7 @@ def main():
         "results": results,
         "limits": [
             "No physical motor motion, current, thermal limit, synchronization or mechanical speed is verified.",
-            "A PWM duty cap is not a current limit; this firmware has no runtime cutoff or stall detector.",
+            "The PWM range limit is not a current limit; this driver alone has no runtime cutoff or stall detector.",
             "GPIO values and ADC completions are injected; PWM waveforms, real ADC noise and asynchronous IRQ timing are not simulated.",
             "Signed voltage tests exercise the shared BLDC command entrypoint, not UART parsing or CAN reception.",
             "Break injection verifies software guards and mock register behavior, not power-stage fault timing.",

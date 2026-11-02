@@ -47,6 +47,7 @@ static uint16_t adc_missing_ticks;
 static uint16_t state_ticks;
 #if MOTOR_OPEN_LOOP_TEST
 static uint16_t commutation_ticks;
+static volatile uint16_t requested_commutation_ticks;
 #else
 static uint32_t stall_ticks;
 static uint8_t previous_hall;
@@ -192,7 +193,7 @@ static void apply_phase(uint8_t index)
 }
 
 #if MOTOR_OPEN_LOOP_TEST
-/* Hall is sampled for diagnostics only; six-step timing is fixed at 100 ms. */
+/* Hall is diagnostic only. Latch a requested period at each phase boundary. */
 static void open_loop_tick(int8_t requested_direction, uint16_t duty)
 {
     uint8_t next_step;
@@ -226,8 +227,8 @@ static void open_loop_tick(int8_t requested_direction, uint16_t duty)
         __HAL_TIM_CLEAR_FLAG(&htim1, TIM_FLAG_UPDATE);
         motor.duty_ticks = duty;
         motor.commutation_step = 1U;
-        motor.commutation_interval_ticks = MOTOR_OPEN_LOOP_COMMUTATION_TICKS;
-        commutation_ticks = MOTOR_OPEN_LOOP_COMMUTATION_TICKS;
+        motor.commutation_interval_ticks = requested_commutation_ticks;
+        commutation_ticks = motor.commutation_interval_ticks;
         motor.state = BLDC_RUNNING;
         apply_phase(open_loop_phases[0]);
         (void)enable_outputs();
@@ -251,7 +252,8 @@ static void open_loop_tick(int8_t requested_direction, uint16_t duty)
             next_step = (next_step <= 1U) ? 6U : (uint8_t)(next_step - 1U);
         }
         motor.commutation_step = next_step;
-        commutation_ticks = MOTOR_OPEN_LOOP_COMMUTATION_TICKS;
+        motor.commutation_interval_ticks = requested_commutation_ticks;
+        commutation_ticks = motor.commutation_interval_ticks;
         apply_phase(open_loop_phases[next_step - 1U]);
     }
 }
@@ -341,6 +343,7 @@ HAL_StatusTypeDef Bldc_Init(void)
     motor.open_loop_test = MOTOR_OPEN_LOOP_TEST;
 #if MOTOR_OPEN_LOOP_TEST
     motor.hall = read_hall();
+    requested_commutation_ticks = MOTOR_OPEN_LOOP_COMMUTATION_TICKS;
 #endif
     memset((void *)&break_diagnostic, 0, sizeof(break_diagnostic));
     requested_mv = 0;
@@ -404,6 +407,24 @@ void Bldc_SetVoltageMv(int16_t voltage_mv, uint32_t received_ms)
     __set_PRIMASK(key);
 }
 
+void Bldc_SetCommutationTicks(uint16_t ticks)
+{
+#if MOTOR_OPEN_LOOP_TEST
+    uint32_t key;
+    if (ticks < MOTOR_OPEN_LOOP_MIN_COMMUTATION_TICKS) {
+        ticks = MOTOR_OPEN_LOOP_MIN_COMMUTATION_TICKS;
+    } else if (ticks > MOTOR_OPEN_LOOP_MAX_COMMUTATION_TICKS) {
+        ticks = MOTOR_OPEN_LOOP_MAX_COMMUTATION_TICKS;
+    }
+    key = __get_PRIMASK();
+    __disable_irq();
+    requested_commutation_ticks = ticks;
+    __set_PRIMASK(key);
+#else
+    (void)ticks;
+#endif
+}
+
 void Bldc_FastTick(void)
 {
     uint32_t now = HAL_GetTick();
@@ -440,7 +461,7 @@ void Bldc_FastTick(void)
         duty = MOTOR_MAX_DUTY_TICKS;
     }
 #if MOTOR_OPEN_LOOP_TEST
-    /* Enforce the bench limit here for every caller, including CAN commands. */
+    /* Bound duty for every caller, including CAN commands. */
     if (duty > MOTOR_OPEN_LOOP_MAX_DUTY_TICKS) {
         duty = MOTOR_OPEN_LOOP_MAX_DUTY_TICKS;
     }
@@ -607,6 +628,9 @@ void Bldc_EmergencyStop(void)
     uint32_t key = __get_PRIMASK();
     __disable_irq();
     requested_mv = 0;
+#if MOTOR_OPEN_LOOP_TEST
+    requested_commutation_ticks = MOTOR_OPEN_LOOP_COMMUTATION_TICKS;
+#endif
     stop_motor();
     __set_PRIMASK(key);
 }
